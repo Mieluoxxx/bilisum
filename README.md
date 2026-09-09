@@ -2,6 +2,9 @@
 
 B站 / YouTube 视频字幕与摘要 CLI。Rust 单文件二进制，无 GUI、无运行时依赖。
 
+- [crates.io](https://crates.io/crates/bilisum)
+- [GitHub](https://github.com/Mieluoxxx/bilisum)
+
 - **两阶段流水线**：先抓字幕（零 LLM 成本），再按模式生成产物
 - **可续跑**：`-c` 复用已有字幕，换模式重生成不必重新转写
 - **本地转写**：yt-dlp + ffmpeg + whisper-rs（Metal 加速），音频走全局缓存
@@ -29,9 +32,23 @@ bilisum models
 
 ## 安装
 
+### 从 crates.io 安装（推荐）
+
 ```bash
-cargo install --path .
-# 或
+cargo install bilisum
+```
+
+更新或重装：
+
+```bash
+cargo install bilisum --force
+```
+
+### 从源码安装
+
+```bash
+cargo install --path . --force
+# 或仅构建二进制
 cargo build --release && cp target/release/bilisum ~/.local/bin/
 ```
 

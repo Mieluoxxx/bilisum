@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "B站 / YouTube 视频字幕与摘要 CLI"
 license = "MIT"
+repository = "https://github.com/Mieluoxxx/bilisum"
+homepage = "https://github.com/Mieluoxxx/bilisum"
+readme = "README.md"
+keywords = ["bilibili", "youtube", "transcription", "summarization", "cli"]
+categories = ["command-line-utilities", "multimedia"]
 
 [[bin]]
 name = "bilisum"
