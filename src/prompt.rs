@@ -103,6 +103,40 @@ pub const LEGACY_PROMPT: &str = r#"你是一位擅长整理视频的助手。请
 pub const TIMESTAMP_CHUNK_SIZE: usize = 10;
 pub const TIMESTAMP_BATCH_CONCURRENCY: usize = 3;
 
+/// polish 分块润色参数：每块字符数与每批并行块数。
+///
+/// 整段一次发送在推理型模型上必然超时（实测 5k 字字幕要 67s，且 reasoning 吃掉
+/// 1.1 万 token，正文被压缩到不足原字幕的 40%）。
+pub const POLISH_CHUNK_CHARS: usize = 1200;
+pub const POLISH_BATCH_CONCURRENCY: usize = 3;
+
+/// 按字符数把字幕切成润色块，尽量落在行边界（whisper/B站字幕都是每段一行）。
+///
+/// ponytail: 单行超过 `POLISH_CHUNK_CHARS` 时不硬切，超长单行会自成一整块。
+pub fn split_for_polish(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !current.is_empty()
+            && current.chars().count() + line.chars().count() > POLISH_CHUNK_CHARS
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+    if !current.trim().is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// timestamp 分块校对 prompt：只含本块编号行，避免长字幕一次送入（超时/超 context）。
 pub fn build_timestamp_chunk_prompt(title: &str, numbered_lines: &str) -> String {
     format!(
@@ -169,6 +203,28 @@ mod tests {
         let prompt = build_timestamp_chunk_prompt("标题B", "2. x");
         assert!(prompt.contains("标题B"));
         assert!(prompt.contains("2. x"));
+    }
+
+    #[test]
+    fn polish_chunks_respect_size_and_keep_order() {
+        let text = (1..=200)
+            .map(|index| format!("第{index}行内容"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = split_for_polish(&text);
+        assert!(chunks.len() > 1, "长字幕应被切块");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= POLISH_CHUNK_CHARS * 2, "块过大");
+        }
+        // 切块不丢内容、不换序
+        let rejoined = chunks.join("\n");
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn short_polish_text_stays_single_chunk() {
+        assert_eq!(split_for_polish("只有一行"), vec!["只有一行".to_string()]);
+        assert!(split_for_polish("\n\n  \n").is_empty());
     }
 
     #[test]

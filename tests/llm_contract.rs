@@ -73,10 +73,10 @@ async fn custom_prompt_reaches_llm_request_body() {
     assert!(request.contains("自定义模板"));
     // 输出上限必须给推理模型留足预算（16k），否则 content 会被截断为空
     assert!(request.contains("\"max_tokens\":16000"), "应使用 16k 上限: {request}");
-    // 推理强度默认 none（关闭推理，省时省 token）
+    // `none` 也不下发：始终思考的模型（GLM）收到 "none" 会直接 400
     assert!(
-        request.contains("\"reasoning_effort\":\"none\""),
-        "应下发 reasoning_effort: {request}"
+        !request.contains("reasoning_effort"),
+        "none 不应下发 reasoning_effort: {request}"
     );
 }
 

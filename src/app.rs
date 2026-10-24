@@ -268,18 +268,7 @@ pub async fn generate(
     });
 
     let text = match mode {
-        Mode::Polish => {
-            // raw.txt 已经是无时间戳纯文本：整段发送，避免人为切断上下文。
-            let template = prompt::resolve_prompt(mode, custom_prompt);
-            let rendered = template
-                .replace("{{title}}", title)
-                .replace("{{transcript}}", &transcript.text);
-            progress(ProgressEvent {
-                stage: "llm",
-                detail: "整段润色字幕",
-            });
-            llm::call(http, &config.llm, &rendered, None).await?
-        }
+        Mode::Polish => polish(&transcript.text, title, config, http, progress).await?,
         Mode::Timestamp => {
             let lines: Vec<String> = transcript
                 .segments
@@ -362,6 +351,60 @@ pub async fn generate(
         text: final_text,
         model,
     })
+}
+
+/// polish 模式的分块润色。
+///
+/// 整段一次发送在推理型模型上会超时（GLM 5k 字字幕实测 67s + 1.1 万 reasoning token），
+/// 因此按字符切块、每批 3 块并发，块顺序保持不变，输出按块拼接。
+async fn polish(
+    text: &str,
+    title: &str,
+    config: &Config,
+    http: &HttpClient,
+    progress: ProgressFn<'_>,
+) -> Result<String> {
+    let chunks = prompt::split_for_polish(text);
+    if chunks.is_empty() {
+        return Ok(String::new());
+    }
+    let total = chunks.len();
+    let template = prompt::resolve_prompt(Mode::Polish, "");
+    let mut polished: Vec<String> = Vec::with_capacity(total);
+
+    for (index, batch) in chunks
+        .chunks(prompt::POLISH_BATCH_CONCURRENCY)
+        .enumerate()
+    {
+        let mut handles = Vec::with_capacity(batch.len());
+        for chunk in batch {
+            let rendered = template
+                .replace("{{title}}", title)
+                .replace("{{transcript}}", chunk);
+            let llm_config = config.llm.clone();
+            let http = http.clone();
+            handles.push(tokio::spawn(async move {
+                llm::call(&http, &llm_config, &rendered, None).await
+            }));
+        }
+        for handle in handles {
+            let raw = handle
+                .await
+                .map_err(|err| AppError::system(format!("润色任务失败：{err}")))??;
+            polished.push(raw.trim().to_string());
+        }
+        let done = ((index + 1) * prompt::POLISH_BATCH_CONCURRENCY).min(total);
+        progress(ProgressEvent {
+            stage: "llm",
+            detail: &if total == 1 {
+                "整段润色字幕".to_string()
+            } else {
+                format!("正在润色字幕 {done}/{total} 段")
+            },
+        });
+    }
+
+    Ok(polished.join("\n\n"))
 }
 
 /// timestamp 模式的分块 1:1 校对。

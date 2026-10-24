@@ -49,6 +49,17 @@ struct ApiError {
     message: Option<String>,
 }
 
+/// 写入 `reasoning_effort`。
+///
+/// `none` 表示"别发这个字段"：部分端点（如始终思考的 GLM）收到 `none` 会直接 400，
+/// 省略则走服务端默认，兼容性最好。
+fn apply_reasoning_effort(body: &mut serde_json::Value, effort: &str) {
+    let effort = effort.trim();
+    if !effort.is_empty() && effort != "none" {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
+}
+
 /// 调用 LLM。
 ///
 /// `max_tokens` 为 None 时使用 `config::MAX_TOKENS`（16k）——小额度会让推理型
@@ -77,11 +88,7 @@ pub async fn call(
         ],
         "max_tokens": max_tokens.unwrap_or(crate::config::MAX_TOKENS)
     });
-    // 推理型模型默认关闭推理（省时省 token）；不支持的端点会忽略该字段
-    let effort = config.reasoning_effort.trim();
-    if !effort.is_empty() {
-        body["reasoning_effort"] = serde_json::json!(effort);
-    }
+    apply_reasoning_effort(&mut body, &config.reasoning_effort);
 
     let auth = format!("Bearer {}", config.api_key.trim());
     let headers = [
@@ -139,10 +146,7 @@ pub async fn test_connection(http: &HttpClient, config: &LlmConfig) -> Result<St
         "messages": [{ "role": "user", "content": "ping" }],
         "max_tokens": 64
     });
-    let effort = config.reasoning_effort.trim();
-    if !effort.is_empty() {
-        body["reasoning_effort"] = serde_json::json!(effort);
-    }
+    apply_reasoning_effort(&mut body, &config.reasoning_effort);
     let auth = format!("Bearer {}", config.api_key.trim());
     let headers = [
         ("Content-Type", "application/json"),
@@ -202,6 +206,16 @@ mod tests {
         // 回归：小额度会被 reasoning_content 吃光，content 变空（finish_reason=length）
         let budget = crate::config::MAX_TOKENS;
         assert!(budget >= 16_000, "输出上限必须给推理模型留足预算，当前 {budget}");
+    }
+
+    #[test]
+    fn reasoning_effort_none_is_omitted_from_body() {
+        // 回归：GLM 等始终思考的模型收到 "none" 会返回 HTTP 400（code 1210）
+        let mut body = serde_json::json!({});
+        apply_reasoning_effort(&mut body, "none");
+        assert!(body.get("reasoning_effort").is_none());
+        apply_reasoning_effort(&mut body, "low");
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]

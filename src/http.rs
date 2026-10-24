@@ -9,6 +9,12 @@ use crate::error::{AppError, Result};
 /// 默认请求超时（秒）。字幕接口偶有慢响应，给足余量。
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// POST JSON（LLM）超时（秒）。
+///
+/// 60s 会被推理型模型的整段润色打断：实测 GLM-5.3 润色 5k 字字幕要 ~67s，
+/// 表现为 `error sending request for url`（reqwest 的 Display 不暴露超时原因）。
+const JSON_TIMEOUT_SECS: u64 = 300;
+
 /// 简化的响应体。
 pub struct HttpResponse {
     pub status: u16,
@@ -59,7 +65,7 @@ impl HttpClient {
         for (key, value) in headers {
             request = request.header(*key, *value);
         }
-        Self::send(request, url).await
+        Self::send(request, url, DEFAULT_TIMEOUT_SECS).await
     }
 
     /// POST JSON。
@@ -69,11 +75,15 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: &serde_json::Value,
     ) -> Result<HttpResponse> {
-        let mut request = self.inner.post(url).json(body);
+        let mut request = self
+            .inner
+            .post(url)
+            .json(body)
+            .timeout(Duration::from_secs(JSON_TIMEOUT_SECS));
         for (key, value) in headers {
             request = request.header(*key, *value);
         }
-        Self::send(request, url).await
+        Self::send(request, url, JSON_TIMEOUT_SECS).await
     }
 
     /// POST 表单（B 站登录接口用）。
@@ -87,15 +97,26 @@ impl HttpClient {
         for (key, value) in headers {
             request = request.header(*key, *value);
         }
-        Self::send(request, url).await
+        Self::send(request, url, DEFAULT_TIMEOUT_SECS).await
     }
 
     /// 统一发送：读取状态、body 与全部 `Set-Cookie` 头。
-    async fn send(request: reqwest::RequestBuilder, url: &str) -> Result<HttpResponse> {
-        let resp = request
-            .send()
-            .await
-            .map_err(|err| AppError::system(format!("请求失败 {url}：{err}")))?;
+    async fn send(
+        request: reqwest::RequestBuilder,
+        url: &str,
+        timeout_secs: u64,
+    ) -> Result<HttpResponse> {
+        let resp = request.send().await.map_err(|err| {
+            // reqwest 的 Display 只有 "error sending request"，超时/连接失败必须自己翻译
+            let detail = if err.is_timeout() {
+                format!("请求超时（{timeout_secs}s）")
+            } else if err.is_connect() {
+                "连接失败（检查网络或代理）".to_string()
+            } else {
+                err.to_string()
+            };
+            AppError::system(format!("请求失败 {url}：{detail}"))
+        })?;
         let status = resp.status().as_u16();
         let set_cookies = resp
             .headers()
