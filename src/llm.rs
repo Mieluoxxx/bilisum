@@ -49,6 +49,33 @@ struct ApiError {
     message: Option<String>,
 }
 
+/// LLM 请求的重试次数（只覆盖传输层失败，不含非 2xx 响应）。
+const LLM_RETRIES: usize = 2;
+
+/// 发请求；传输层失败（连接中断、截断、超时）重试。
+///
+/// 非流式响要静默 60~90s 才吐出整块 body，长连接偶发被中间节点掐断
+/// （表现为 `error decoding response body`），重试是这里成本最低的容错。
+async fn post_with_retry(
+    http: &HttpClient,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+) -> Result<crate::http::HttpResponse> {
+    let mut attempt = 0;
+    loop {
+        match http.post_json(url, headers, body).await {
+            Ok(resp) => return Ok(resp),
+            Err(err) if attempt < LLM_RETRIES => {
+                attempt += 1;
+                tracing::warn!(attempt, error = %err.message, "LLM 请求传输失败，重试");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// 写入 `reasoning_effort`。
 ///
 /// `none` 表示"别发这个字段"：部分端点（如始终思考的 GLM）收到 `none` 会直接 400，
@@ -96,7 +123,7 @@ pub async fn call(
         ("Authorization", auth.as_str()),
     ];
     tracing::info!(endpoint = %endpoint.url, model = %model, max_tokens = ?max_tokens, "调用 LLM");
-    let resp = http.post_json(&endpoint.url, &headers, &body).await?;
+    let resp = post_with_retry(http, &endpoint.url, &headers, &body).await?;
     let status = resp.status;
     let text = resp.text().await?;
 

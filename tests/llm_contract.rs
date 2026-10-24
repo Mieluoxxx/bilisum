@@ -21,9 +21,16 @@ fn mock_server(response_body: &'static str) -> (String, std::sync::mpsc::Receive
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = vec![0u8; 65536];
             let mut total = Vec::new();
-            // 读到 header 结束 + body（简单起见读一轮即可）
-            if let Ok(n) = stream.read(&mut buf) {
+            // 必须读到 Content-Length 声明的完整 body：请求常常分包到达，只读一轮会断言失败
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
                 total.extend_from_slice(&buf[..n]);
+                if request_complete(&total) {
+                    break;
+                }
             }
             let request = String::from_utf8_lossy(&total).to_string();
             tx.send(request).ok();
@@ -39,6 +46,25 @@ fn mock_server(response_body: &'static str) -> (String, std::sync::mpsc::Receive
     });
 
     (format!("http://{addr}"), rx)
+}
+
+/// 判断已收到的字节是否包含完整的 HTTP 请求（header + Content-Length 声明的 body）。
+fn request_complete(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(split) = text.find("\r\n\r\n") else {
+        return false;
+    };
+    let head = text[..split].to_ascii_lowercase();
+    let body_len = bytes.len() - (split + 4);
+    match head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        Some(expected) => body_len >= expected,
+        // 没有 Content-Length：header 收全即可
+        None => true,
+    }
 }
 
 const OK_RESPONSE: &str = r#"{"choices":[{"message":{"content":"润色后的字幕"}}]}"#;
@@ -230,4 +256,59 @@ async fn polish_sends_the_entire_raw_text_in_one_request() {
     assert!(request.contains("第一段\\n第二段\\n第三段"));
     assert!(!request.contains("1. 第一段"));
     assert!(!request.contains("2. 第二段"));
+}
+
+/// 第一次响应故意在 chunked 传输中途断开（模拟 90s 静默期被中间节点掐断），第二次正常返回。
+fn truncated_then_ok_server(
+    response_body: &'static str,
+) -> (String, std::sync::mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+    let addr = listener.local_addr().expect("本地地址");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        // 第一次：不完整的 chunked 响应（缺终止块）
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"cho",
+            );
+            let _ = stream.flush();
+            // 不写终止块，直接关闭
+        }
+        // 第二次：正常响应
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            tx.send(()).ok();
+        }
+    });
+
+    (format!("http://{addr}"), rx)
+}
+
+#[tokio::test]
+async fn truncated_body_is_retried() {
+    let (base_url, rx) = truncated_then_ok_server(OK_RESPONSE);
+    let http = HttpClient::new().unwrap();
+    let config = LlmConfig {
+        api_key: "sk-test".to_string(),
+        base_url,
+        model: "m".to_string(),
+        reasoning_effort: String::new(),
+    };
+    let reply = llm::call(&http, &config, "x", None)
+        .await
+        .expect("截断后应重试成功");
+    assert_eq!(reply, "润色后的字幕");
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("第二次请求应到达");
 }

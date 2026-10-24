@@ -2,6 +2,7 @@
 //!
 //! CLI 无浏览器 CORS 限制，直接使用 `reqwest`；此层只负责统一超时、User-Agent 与响应读取。
 
+use std::error::Error as _;
 use std::time::Duration;
 
 use crate::error::{AppError, Result};
@@ -125,10 +126,15 @@ impl HttpClient {
             .filter_map(|value| value.to_str().ok())
             .map(|value| value.to_string())
             .collect::<Vec<_>>();
-        let body = resp
-            .text()
-            .await
-            .map_err(|err| AppError::system(format!("读取响应失败 {url}：{err}")))?;
+        let body = resp.text().await.map_err(|err| {
+            // 非流式响应要静默 60~90s 才吐出整块 body（实测 62KB），中途任何一跳
+            // （代理/Cloudflare）闲太久就会掐断，表现为 "error decoding response body"
+            let detail = match err.source() {
+                Some(cause) => format!("{}（{cause}）", err),
+                None => err.to_string(),
+            };
+            AppError::system(format!("读取响应失败 {url}：{detail}"))
+        })?;
         Ok(HttpResponse {
             status,
             body,
