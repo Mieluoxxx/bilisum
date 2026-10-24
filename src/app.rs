@@ -9,6 +9,8 @@
 //!
 //! `app` 层不打印任何东西：只返回结果或通过回调上报进度，为将来的 TUI 留边界。
 
+use futures_util::stream::StreamExt;
+
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::http::HttpClient;
@@ -370,30 +372,23 @@ async fn polish(
     }
     let total = chunks.len();
     let template = prompt::resolve_prompt(Mode::Polish, "");
-    let mut polished: Vec<String> = Vec::with_capacity(total);
+    // 不设并发上限：每块要 60~90s（模型恒定思考），串行化只会白等。
+    // 撞到端点限流由 llm 层的 429 退避兜住。
+    let mut stream = futures_util::stream::iter(chunks.iter().enumerate().map(|(index, chunk)| {
+        let rendered = template
+            .replace("{{title}}", title)
+            .replace("{{transcript}}", chunk);
+        async move {
+            let text = llm::call(http, &config.llm, &rendered, None).await?;
+            Ok::<(usize, String), AppError>((index, text.trim().to_string()))
+        }
+    }))
+    .buffer_unordered(total);
 
-    for (index, batch) in chunks
-        .chunks(prompt::POLISH_BATCH_CONCURRENCY)
-        .enumerate()
-    {
-        let mut handles = Vec::with_capacity(batch.len());
-        for chunk in batch {
-            let rendered = template
-                .replace("{{title}}", title)
-                .replace("{{transcript}}", chunk);
-            let llm_config = config.llm.clone();
-            let http = http.clone();
-            handles.push(tokio::spawn(async move {
-                llm::call(&http, &llm_config, &rendered, None).await
-            }));
-        }
-        for handle in handles {
-            let raw = handle
-                .await
-                .map_err(|err| AppError::system(format!("润色任务失败：{err}")))??;
-            polished.push(raw.trim().to_string());
-        }
-        let done = ((index + 1) * prompt::POLISH_BATCH_CONCURRENCY).min(total);
+    let mut polished: Vec<(usize, String)> = Vec::with_capacity(total);
+    while let Some(item) = stream.next().await {
+        polished.push(item?);
+        let done = polished.len();
         progress(ProgressEvent {
             stage: "llm",
             detail: &if total == 1 {
@@ -403,8 +398,13 @@ async fn polish(
             },
         });
     }
-
-    Ok(polished.join("\n\n"))
+    // 完成顺序随机，按块序拼回原文顺序
+    polished.sort_by_key(|(index, _)| *index);
+    Ok(polished
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n"))
 }
 
 /// timestamp 模式的分块 1:1 校对。

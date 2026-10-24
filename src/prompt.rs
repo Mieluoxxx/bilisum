@@ -103,12 +103,11 @@ pub const LEGACY_PROMPT: &str = r#"你是一位擅长整理视频的助手。请
 pub const TIMESTAMP_CHUNK_SIZE: usize = 10;
 pub const TIMESTAMP_BATCH_CONCURRENCY: usize = 3;
 
-/// polish 分块润色参数：每块字符数与每批并行块数。
+/// polish 分块字符数（并发不设上限：所有块一次全发，撞限流由 429 退避兜住）。
 ///
 /// 整段一次发送在推理型模型上必然超时（实测 5k 字字幕要 67s，且 reasoning 吃掉
 /// 1.1 万 token，正文被压缩到不足原字幕的 40%）。
 pub const POLISH_CHUNK_CHARS: usize = 1200;
-pub const POLISH_BATCH_CONCURRENCY: usize = 3;
 
 /// 按字符数把字幕切成润色块，尽量落在行边界（whisper/B站字幕都是每段一行）。
 ///

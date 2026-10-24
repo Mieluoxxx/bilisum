@@ -49,8 +49,11 @@ struct ApiError {
     message: Option<String>,
 }
 
-/// LLM 请求的重试次数（只覆盖传输层失败，不含非 2xx 响应）。
-const LLM_RETRIES: usize = 2;
+/// 传输层失败（连接中断/截断）重试次数。
+const TRANSPORT_RETRIES: usize = 2;
+
+/// 429 限流重试次数：polish 全块并发必然撞限流，退避到端点满意为止。
+const RATE_LIMIT_RETRIES: usize = 6;
 
 /// 发请求；传输层失败（连接中断、截断、超时）重试。
 ///
@@ -62,18 +65,37 @@ async fn post_with_retry(
     headers: &[(&str, &str)],
     body: &serde_json::Value,
 ) -> Result<crate::http::HttpResponse> {
-    let mut attempt = 0;
+    let mut transport = 0;
+    let mut limited = 0;
     loop {
         match http.post_json(url, headers, body).await {
+            // 指数退避：5s、10s、20s、40s、60s、60s（+ 抖动避免同批块同时重试）
+            Ok(resp) if resp.status == 429 && limited < RATE_LIMIT_RETRIES => {
+                limited += 1;
+                let wait_secs = (5u64 << (limited - 1)).min(60);
+                tracing::warn!(attempt = limited, wait_secs, "LLM 返回 429，退避重试");
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    wait_secs * 1000 + jitter_ms(),
+                ))
+                .await;
+            }
             Ok(resp) => return Ok(resp),
-            Err(err) if attempt < LLM_RETRIES => {
-                attempt += 1;
-                tracing::warn!(attempt, error = %err.message, "LLM 请求传输失败，重试");
+            Err(err) if transport < TRANSPORT_RETRIES => {
+                transport += 1;
+                tracing::warn!(attempt = transport, error = %err.message, "LLM 请求传输失败，重试");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(err) => return Err(err),
         }
     }
+}
+
+/// 0~999ms 抖动：并发块同时吃 429 时避免齐刷刷重试再撞一次。
+fn jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()) % 1000)
+        .unwrap_or(0)
 }
 
 /// 写入 `reasoning_effort`。

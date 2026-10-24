@@ -312,3 +312,122 @@ async fn truncated_body_is_retried() {
     rx.recv_timeout(std::time::Duration::from_secs(5))
         .expect("第二次请求应到达");
 }
+
+/// 只接受 `expected` 条连接、全部到齐后才统一回包。
+/// 客户端若是串行，这里会卡在第二条 accept 直到超时 —— 用"必须并发"来验证并行度。
+fn barrier_server(expected: usize, response_body: &'static str) -> (String, std::sync::mpsc::Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+    let addr = listener.local_addr().expect("本地地址");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut streams = Vec::new();
+        for _ in 0..expected {
+            // 加超时：串行客户端下会卡住，测试能及时失败而不是挂死
+            listener.set_nonblocking(false).ok();
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    streams.push(stream);
+                }
+                Err(_) => return,
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        for mut stream in streams {
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+        tx.send(expected).ok();
+    });
+
+    (format!("http://{addr}"), rx)
+}
+
+#[tokio::test]
+async fn polish_runs_chunks_concurrently() {
+    // 60 行 × 70 字 → 多块；必须同时有对应条数连接在飞（串行实现会卡死在 barrier）
+    let lines: Vec<Segment> = (1..=60)
+        .map(|index| Segment::new(index as f64, index as f64 + 1.0, "字".repeat(70)))
+        .collect();
+    let transcript = Transcript::from_segments(lines, TranscriptSource::Whisper);
+    let expected = bilisum::prompt::split_for_polish(&transcript.text).len();
+    assert!(expected >= 3, "样本应被切成多块，实际 {expected}");
+    let (base_url, rx) = barrier_server(expected, r#"{"choices":[{"message":{"content":"块"}}]}"#);
+    let http = HttpClient::new().unwrap();
+    let config = bilisum::config::Config {
+        llm: LlmConfig {
+            api_key: "sk-test".to_string(),
+            base_url,
+            model: "m".to_string(),
+            reasoning_effort: String::new(),
+        },
+        ..Default::default()
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bilisum::app::generate(
+            bilisum::app::GenerateInput {
+                transcript: &transcript,
+                title: "并发测试",
+                url: "https://example.test/video",
+                mode: Mode::Polish,
+                custom_prompt: "",
+                config: &config,
+                http: &http,
+            },
+            &|_| {},
+        ),
+    )
+    .await
+    .expect("并发请求未同时到达，疑似仍按批串行")
+    .unwrap();
+
+    assert_eq!(result.text.split("\n\n").count(), expected, "各块应按块序拼接");
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_request_is_retried() {
+    // 并发滑窗会撞限流：第一次 429，第二次正常
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定端口");
+    let addr = listener.local_addr().expect("本地地址");
+    std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let (status, body) = if attempt == 0 {
+                ("429 Too Many Requests", r#"{"error":{"message":"rate limit"}}"#)
+            } else {
+                ("200 OK", r#"{"choices":[{"message":{"content":"重试成功"}}]}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let http = HttpClient::new().unwrap();
+    let config = LlmConfig {
+        api_key: "sk-test".to_string(),
+        base_url: format!("http://{addr}"),
+        model: "m".to_string(),
+        reasoning_effort: String::new(),
+    };
+    let reply = llm::call(&http, &config, "x", None)
+        .await
+        .expect("429 应退避后重试成功");
+    assert_eq!(reply, "重试成功");
+}
